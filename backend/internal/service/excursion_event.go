@@ -27,11 +27,13 @@ type excursionEventService struct {
 	repository  repository.ExcursionEventRepository
 	disposition repository.DispositionDecisionRepository
 	evidence    repository.SensorEvidenceRepository
+	windows     repository.TemperatureWindowRepository
+	containers  repository.TransportContainerRepository
 	security    SecurityService
 }
 
-func NewExcursionEventService(repo repository.ExcursionEventRepository, disposition repository.DispositionDecisionRepository, evidence repository.SensorEvidenceRepository, security SecurityService) ExcursionEventService {
-	return &excursionEventService{repository: repo, disposition: disposition, evidence: evidence, security: security}
+func NewExcursionEventService(repo repository.ExcursionEventRepository, disposition repository.DispositionDecisionRepository, evidence repository.SensorEvidenceRepository, windows repository.TemperatureWindowRepository, containers repository.TransportContainerRepository, security SecurityService) ExcursionEventService {
+	return &excursionEventService{repository: repo, disposition: disposition, evidence: evidence, windows: windows, containers: containers, security: security}
 }
 
 func (s *excursionEventService) List(ctx context.Context, query dto.PageQuery) (repository.Page[model.ExcursionEvent], error) {
@@ -69,11 +71,80 @@ func (s *excursionEventService) Create(ctx context.Context, input dto.CreateExcu
 	if item.ContainerCode == "" || item.WindowCode == "" || item.SensorEvidence == "" || item.DurationMinutes < 1 {
 		return model.ExcursionEvent{}, fmt.Errorf("%w: container, temperature window, duration and sensor evidence are required", ErrInvalidInput)
 	}
+	s.assessExcursion(ctx, &item, actor, requestID)
 	if err := s.repository.Create(ctx, &item); err != nil {
 		return model.ExcursionEvent{}, fmt.Errorf("create 偏差事件: %w", err)
 	}
-	_ = s.security.Audit(ctx, actor, requestID, "create", "ExcursionEvent", item.ID, "", item.Status, "created 偏差事件")
+	_ = s.security.Audit(ctx, actor, requestID, "create", "ExcursionEvent", item.ID, "", item.Status, firstNonEmpty(item.AssessmentNote, "created 偏差事件"))
 	return item, nil
+}
+
+// assessExcursion evaluates a freshly registered deviation against the effective
+// temperature window. A breach that outlasts the allowed duration quarantines the
+// container immediately (repeat reports for an already quarantined container are
+// not migrated again); shorter breaches only flag the record for review. Missing
+// or inactive windows are registered as-is and routed to manual judgement.
+func (s *excursionEventService) assessExcursion(ctx context.Context, item *model.ExcursionEvent, actor, requestID string) {
+	window, err := s.windows.FindByCode(ctx, item.WindowCode)
+	if err != nil {
+		item.AssessmentOutcome = model.AssessmentManualReview
+		item.AssessmentNote = fmt.Sprintf("温控规则 %s 缺失，偏差已照常登记；结果：请人工判断", item.WindowCode)
+		return
+	}
+	if window.Status != string(constants.WindowStateActive) {
+		item.AssessmentOutcome = model.AssessmentManualReview
+		item.AssessmentNote = fmt.Sprintf("温控规则 %s 未生效（当前状态 %s），偏差已照常登记；结果：请人工判断", window.Code, window.Status)
+		return
+	}
+	breach := item.ObservedTempC < window.MinimumCelsius || item.ObservedTempC > window.MaximumCelsius
+	if !breach {
+		item.AssessmentOutcome = model.AssessmentWithinLimits
+		item.AssessmentNote = fmt.Sprintf("触发温度 %.1f°C 位于规则 %s 窗口 [%.1f, %.1f]°C 内，允许时长 %d 分钟；结果：按常规流程复核",
+			item.ObservedTempC, window.Code, window.MinimumCelsius, window.MaximumCelsius, window.MaxExcursionMinutes)
+		return
+	}
+	if item.DurationMinutes <= window.MaxExcursionMinutes {
+		item.AssessmentOutcome = model.AssessmentReviewOnly
+		item.AssessmentNote = fmt.Sprintf("触发温度 %.1f°C 越出规则 %s 窗口 [%.1f, %.1f]°C，持续 %d 分钟未超过允许时长 %d 分钟；结果：提示复核，容器 %s 状态不变",
+			item.ObservedTempC, window.Code, window.MinimumCelsius, window.MaximumCelsius, item.DurationMinutes, window.MaxExcursionMinutes, item.ContainerCode)
+		return
+	}
+	container, err := s.containers.FindByCode(ctx, item.ContainerCode)
+	if err != nil {
+		item.AssessmentOutcome = model.AssessmentManualReview
+		item.AssessmentNote = fmt.Sprintf("触发温度 %.1f°C 越出规则 %s 窗口 [%.1f, %.1f]°C，持续 %d 分钟超过允许时长 %d 分钟，但容器 %s 未找到；结果：请人工判断",
+			item.ObservedTempC, window.Code, window.MinimumCelsius, window.MaximumCelsius, item.DurationMinutes, window.MaxExcursionMinutes, item.ContainerCode)
+		return
+	}
+	if container.Status == string(constants.ContainerStateQuarantine) {
+		item.AssessmentOutcome = model.AssessmentAlreadyQuarantined
+		item.AssessmentNote = fmt.Sprintf("触发温度 %.1f°C 越出规则 %s 窗口 [%.1f, %.1f]°C，持续 %d 分钟超过允许时长 %d 分钟；结果：容器 %s 已处于隔离状态，重复上报不再迁移",
+			item.ObservedTempC, window.Code, window.MinimumCelsius, window.MaximumCelsius, item.DurationMinutes, window.MaxExcursionMinutes, item.ContainerCode)
+		return
+	}
+	if !constants.CanTransition(constants.TransportContainerTransitions, container.Status, string(constants.ContainerStateQuarantine)) {
+		item.AssessmentOutcome = model.AssessmentManualReview
+		item.AssessmentNote = fmt.Sprintf("触发温度 %.1f°C 越出规则 %s 窗口 [%.1f, %.1f]°C，持续 %d 分钟超过允许时长 %d 分钟，但容器 %s 当前状态 %s 不允许自动隔离；结果：请人工判断",
+			item.ObservedTempC, window.Code, window.MinimumCelsius, window.MaximumCelsius, item.DurationMinutes, window.MaxExcursionMinutes, item.ContainerCode, container.Status)
+		return
+	}
+	before := container.Status
+	expectedVersion := container.Version
+	container.Status = string(constants.ContainerStateQuarantine)
+	container.Version = expectedVersion + 1
+	container.UpdatedAt = time.Now().UTC()
+	reason := fmt.Sprintf("偏差 %s 自动隔离：触发温度 %.1f°C 持续 %d 分钟超过允许时长 %d 分钟",
+		item.Code, item.ObservedTempC, item.DurationMinutes, window.MaxExcursionMinutes)
+	audit := auditLog(actor, requestID, "transition", "TransportContainer", container.ID, before, container.Status, reason)
+	if err := s.containers.Update(ctx, container.ID, expectedVersion, &container, audit); err != nil {
+		item.AssessmentOutcome = model.AssessmentManualReview
+		item.AssessmentNote = fmt.Sprintf("触发温度 %.1f°C 越出规则 %s 窗口 [%.1f, %.1f]°C，持续 %d 分钟超过允许时长 %d 分钟，但容器 %s 自动隔离失败；结果：请人工判断",
+			item.ObservedTempC, window.Code, window.MinimumCelsius, window.MaximumCelsius, item.DurationMinutes, window.MaxExcursionMinutes, item.ContainerCode)
+		return
+	}
+	item.AssessmentOutcome = model.AssessmentAutoQuarantine
+	item.AssessmentNote = fmt.Sprintf("触发温度 %.1f°C 越出规则 %s 窗口 [%.1f, %.1f]°C，持续 %d 分钟超过允许时长 %d 分钟；结果：容器 %s 已立即隔离",
+		item.ObservedTempC, window.Code, window.MinimumCelsius, window.MaximumCelsius, item.DurationMinutes, window.MaxExcursionMinutes, item.ContainerCode)
 }
 
 func (s *excursionEventService) Update(ctx context.Context, id uint, input dto.UpdateExcursionEvent, actor, requestID string) (model.ExcursionEvent, error) {

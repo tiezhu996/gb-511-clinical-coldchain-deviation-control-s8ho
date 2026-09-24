@@ -25,6 +25,15 @@ const (
 
 var AllExcursionState = []string{"open", "in_review", "decided", "closed"}
 
+type WindowState string
+
+const (
+	WindowStateDraft      WindowState = "draft"
+	WindowStateActive     WindowState = "active"
+	WindowStateExpired    WindowState = "expired"
+	WindowStateSuperseded WindowState = "superseded"
+)
+
 var TransportContainerTransitions = map[string]map[string]bool{
 	"ready":      {"in_transit": true, "quarantine": true},
 	"in_transit": {"quarantine": true, "cleared": true, "ready": true},

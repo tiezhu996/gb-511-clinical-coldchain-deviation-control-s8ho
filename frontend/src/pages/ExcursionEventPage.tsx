@@ -27,6 +27,18 @@ function nextExcursionState(item: DomainRecord) {
   return '';
 }
 
+const assessmentMeta: Record<string, { tone: 'danger' | 'warning' | 'success' | 'neutral'; label: string }> = {
+  auto_quarantine: { tone: 'danger', label: '已自动隔离' },
+  already_quarantined: { tone: 'warning', label: '重复上报 · 保持隔离' },
+  review_only: { tone: 'warning', label: '提示复核' },
+  manual_review: { tone: 'neutral', label: '人工判断' },
+  within_limits: { tone: 'success', label: '窗口内' },
+};
+
+function assessmentLabel(outcome?: string) {
+  return outcome ? assessmentMeta[outcome]?.label || outcome : '';
+}
+
 export default function ExcursionEventPage() {
   const excursions = useExcursionEventStore();
   const dispositions = useDispositionDecisionStore();
@@ -34,6 +46,7 @@ export default function ExcursionEventPage() {
   const evidenceStore = useSensorEvidenceStore();
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  const [scenario, setScenario] = useState<'exceed' | 'within'>('exceed');
   const [pending, setPending] = useState<{ item: DomainRecord; state: string } | null>(null);
   const session = getSession();
   const canReport = roleAtLeast(session?.role, 'operator');
@@ -50,7 +63,8 @@ export default function ExcursionEventPage() {
   const createExcursion = async () => {
     const suffix = Date.now().toString().slice(-5); const now = new Date().toISOString();
     const code = `EE-UI-${suffix}`; const objectKey = `sensor/tc-002/${code.toLowerCase()}.csv`;
-    await excursions.createRecord('excursions', { code, name: 'TC-002 温度越界告警', description: '内置工作台登记的传感器高温偏差', facility: '沪杭运输线', owner: '未分配', category: '高温偏差', riskLevel: 'high', metricValue: 9.3, metricUnit: 'C', effectiveAt: now, evidence: `minio://clinical-evidence/${objectKey}`, relatedCode: 'TC-002', containerCode: 'TC-002', windowCode: 'TW-001', observedTempC: 9.3, durationMinutes: 18, detectedAt: now, sensorEvidence: `minio://clinical-evidence/${objectKey}` });
+    const overLimit = scenario === 'exceed';
+    await excursions.createRecord('excursions', { code, name: overLimit ? 'TC-002 温度越界超限' : 'TC-002 短时越界未超时长', description: overLimit ? '内置工作台登记的传感器高温偏差，持续 18 分钟超过规则允许时长' : '内置工作台登记的传感器高温偏差，持续 10 分钟未超过规则允许时长', facility: '沪杭运输线', owner: '未分配', category: '高温偏差', riskLevel: 'high', metricValue: 9.3, metricUnit: 'C', effectiveAt: now, evidence: `minio://clinical-evidence/${objectKey}`, relatedCode: 'TC-002', containerCode: 'TC-002', windowCode: 'TW-001', observedTempC: 9.3, durationMinutes: overLimit ? 18 : 10, detectedAt: now, sensorEvidence: `minio://clinical-evidence/${objectKey}` });
     await registerSensorEvidence({ code: `SE-${suffix}`, excursionCode: code, containerCode: 'TC-002', objectKey, sha256: 'd'.repeat(64), mediaType: 'text/csv', sizeBytes: 2048, capturedAt: now, source: 'ui-logger-import' });
     await evidenceStore.load();
     setCreateOpen(false);
@@ -63,9 +77,9 @@ export default function ExcursionEventPage() {
   return <main className="workspace"><header className="page-header"><div><p className="eyebrow">EXCURSION RESPONSE</p><h1>偏差处理</h1><p>关联运输容器、温控规则和原始传感器证据，完成影响评估。</p></div>{canReport && <Button variant="contained" startIcon={<AddAlertOutlinedIcon />} onClick={() => setCreateOpen(true)}>登记偏差</Button>}</header>
     <section className="metrics"><MetricCard label="偏差事件" value={excursions.meta.total} detail="全量可追溯" /><MetricCard label="待闭环" value={pendingCount} detail="待质量评估" /><MetricCard label="严重偏差" value={critical} detail="优先隔离" /></section>
     {(excursions.error || evidenceStore.error) && <div className="alert" role="alert">{excursions.error || evidenceStore.error}</div>}
-    <section className="split-workspace"><div className="record-list">{excursions.items.map((item) => { const rule = windows.items.find((window) => window.code === item.windowCode); return <button key={item.id} className={selectedId === item.id ? 'record-row selected' : 'record-row'} onClick={() => setSelectedId(item.id)}><span><strong>{item.code}</strong><small>{item.containerCode || item.relatedCode} · {item.windowCode || '未绑定规则'}</small></span><TemperatureBadge value={item.observedTempC ?? item.metricValue} minimum={rule?.minimumCelsius} maximum={rule?.maximumCelsius} /><StatusBadge status={item.status} /></button>; })}</div>
-      <aside className="detail-pane">{selected ? <><header><div><small>{selected.code}</small><h2>{selected.name}</h2></div><StatusBadge status={selected.status} /></header><div className="detail-grid"><span><small>运输容器</small>{selected.containerCode || selected.relatedCode}</span><span><small>温控规则</small>{selected.windowCode || '-'}</span><span><small>持续时长</small>{selected.durationMinutes || 0} 分钟</span><span><small>检测时间</small>{formatDate(selected.detectedAt || selected.effectiveAt)}</span></div><h3>传感器证据</h3><EvidenceList evidence={selectedEvidence.length ? selectedEvidence : selected.sensorEvidence || selected.evidence} /><DecisionPanel decision={decision} compact />{canReview && nextExcursionState(selected) && <Button variant="contained" startIcon={<TaskAltOutlinedIcon />} onClick={() => setPending({ item: selected, state: nextExcursionState(selected) })}>{selected.status === 'open' ? '接收复核' : selected.status === 'in_review' ? '完成影响评估' : '关闭事件'}</Button>}</> : <div className="empty">选择一个偏差事件</div>}</aside></section>
-    <ConfirmDialog open={createOpen} title="登记温度偏差" onCancel={() => setCreateOpen(false)} onConfirm={() => void createExcursion()}><p>将保存容器、温控规则、峰值温度、持续时长和 MinIO 传感器证据。</p></ConfirmDialog>
+    <section className="split-workspace"><div className="record-list">{excursions.items.map((item) => { const rule = windows.items.find((window) => window.code === item.windowCode); return <button key={item.id} className={selectedId === item.id ? 'record-row selected' : 'record-row'} onClick={() => setSelectedId(item.id)}><span><strong>{item.code}</strong><small>{item.containerCode || item.relatedCode} · {item.windowCode || '未绑定规则'}{item.assessmentOutcome ? ` · ${assessmentLabel(item.assessmentOutcome)}` : ''}</small></span><TemperatureBadge value={item.observedTempC ?? item.metricValue} minimum={rule?.minimumCelsius} maximum={rule?.maximumCelsius} /><StatusBadge status={item.status} /></button>; })}</div>
+      <aside className="detail-pane">{selected ? <><header><div><small>{selected.code}</small><h2>{selected.name}</h2></div><StatusBadge status={selected.status} /></header>{selected.assessmentNote && <div className={`assessment assessment--${assessmentMeta[selected.assessmentOutcome || '']?.tone || 'neutral'}`} role="status"><strong>{assessmentLabel(selected.assessmentOutcome) || '评估结果'}</strong><span>{selected.assessmentNote}</span></div>}<div className="detail-grid"><span><small>运输容器</small>{selected.containerCode || selected.relatedCode}</span><span><small>温控规则</small>{selected.windowCode || '-'}</span><span><small>持续时长</small>{selected.durationMinutes || 0} 分钟</span><span><small>检测时间</small>{formatDate(selected.detectedAt || selected.effectiveAt)}</span></div><h3>传感器证据</h3><EvidenceList evidence={selectedEvidence.length ? selectedEvidence : selected.sensorEvidence || selected.evidence} /><DecisionPanel decision={decision} compact />{canReview && nextExcursionState(selected) && <Button variant="contained" startIcon={<TaskAltOutlinedIcon />} onClick={() => setPending({ item: selected, state: nextExcursionState(selected) })}>{selected.status === 'open' ? '接收复核' : selected.status === 'in_review' ? '完成影响评估' : '关闭事件'}</Button>}</> : <div className="empty">选择一个偏差事件</div>}</aside></section>
+    <ConfirmDialog open={createOpen} title="登记温度偏差" onCancel={() => setCreateOpen(false)} onConfirm={() => void createExcursion()}><p>将保存容器、温控规则、峰值温度、持续时长和 MinIO 传感器证据，系统按生效规则自动评估。</p><div className="scenario-picker" role="radiogroup" aria-label="偏差场景"><label><input type="radio" name="excursion-scenario" checked={scenario === 'exceed'} onChange={() => setScenario('exceed')} />超限：9.3°C 持续 18 分钟，超过 TW-001 允许的 15 分钟，登记后立即隔离容器</label><label><input type="radio" name="excursion-scenario" checked={scenario === 'within'} onChange={() => setScenario('within')} />未超时长：9.3°C 持续 10 分钟，仅提示复核，容器状态不变</label></div></ConfirmDialog>
     <ConfirmDialog open={Boolean(pending)} title="确认偏差状态迁移" onCancel={() => setPending(null)} onConfirm={() => void transition()}><p>偏差不能跳过复核；形成影响评估时必须存在传感器证据。</p><strong>{pending?.item.status} → {pending?.state}</strong></ConfirmDialog>
   </main>;
 }

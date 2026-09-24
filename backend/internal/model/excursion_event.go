@@ -14,15 +14,19 @@ type ExcursionEvent struct {
 	DetectedAt      time.Time `json:"detectedAt" gorm:"index"`
 	SensorEvidence  string    `json:"sensorEvidence" gorm:"size:2000"`
 	Reviewer        string    `json:"reviewer" gorm:"size:80"`
-	Facility        string    `json:"facility" gorm:"size:120;index"`
-	Owner           string    `json:"owner" gorm:"size:120;index"`
-	Category        string    `json:"category" gorm:"size:80;index"`
-	RiskLevel       string    `json:"riskLevel" gorm:"size:32;index"`
-	MetricValue     float64   `json:"metricValue"`
-	MetricUnit      string    `json:"metricUnit" gorm:"size:24"`
-	EffectiveAt     time.Time `json:"effectiveAt"`
-	Evidence        string    `json:"evidence" gorm:"size:2000"`
-	RelatedCode     string    `json:"relatedCode" gorm:"size:64;index"`
+	// AssessmentOutcome and AssessmentNote capture the automated rule evaluation
+	// performed at registration: trigger temperature, allowed duration and result.
+	AssessmentOutcome string    `json:"assessmentOutcome" gorm:"size:32;index"`
+	AssessmentNote    string    `json:"assessmentNote" gorm:"size:500"`
+	Facility          string    `json:"facility" gorm:"size:120;index"`
+	Owner             string    `json:"owner" gorm:"size:120;index"`
+	Category          string    `json:"category" gorm:"size:80;index"`
+	RiskLevel         string    `json:"riskLevel" gorm:"size:32;index"`
+	MetricValue       float64   `json:"metricValue"`
+	MetricUnit        string    `json:"metricUnit" gorm:"size:24"`
+	EffectiveAt       time.Time `json:"effectiveAt"`
+	Evidence          string    `json:"evidence" gorm:"size:2000"`
+	RelatedCode       string    `json:"relatedCode" gorm:"size:64;index"`
 }
 
 func (item *ExcursionEvent) GetBase() *BaseModel { return &item.BaseModel }
@@ -30,3 +34,13 @@ func (item *ExcursionEvent) GetBase() *BaseModel { return &item.BaseModel }
 func (item ExcursionEvent) TableName() string { return "excursion_events" }
 
 var ExcursionEventInitialStatus = "open"
+
+// Automated assessment outcomes decided when a deviation is registered against
+// the effective temperature window.
+const (
+	AssessmentAutoQuarantine     = "auto_quarantine"
+	AssessmentAlreadyQuarantined = "already_quarantined"
+	AssessmentReviewOnly         = "review_only"
+	AssessmentManualReview       = "manual_review"
+	AssessmentWithinLimits       = "within_limits"
+)
