@@ -9,7 +9,7 @@ export interface EntityState {
   loading: boolean;
   error: string;
   load: (path: string, search?: string) => Promise<void>;
-  createRecord: (path: string, input: Partial<DomainRecord>) => Promise<void>;
+  createRecord: (path: string, input: Partial<DomainRecord>) => Promise<DomainRecord | undefined>;
   transition: (path: string, item: DomainRecord, status: string, reason?: string, evidence?: string) => Promise<void>;
 }
 export type EntityStore = ReturnType<typeof createEntityStore>;
@@ -27,8 +27,9 @@ export function createEntityStore() {
     createRecord: async (path, input) => {
       set({ loading: true, error: '' });
       try {
-        await request<DomainRecord>(`/${path}`, { method: 'POST', body: JSON.stringify(input) });
+        const result = await request<DomainRecord>(`/${path}`, { method: 'POST', body: JSON.stringify(input) });
         await get().load(path);
+        return result.data;
       } catch (error) { set({ error: error instanceof Error ? error.message : String(error), loading: false }); throw error; }
     },
     transition: async (path, item, status, reason = '质量工作台人工确认', evidence = '') => {

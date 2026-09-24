@@ -33,6 +33,9 @@ export interface DomainRecord {
   detectedAt?: string;
   sensorEvidence?: string;
   reviewer?: string;
+  assessmentOutcome?: string;
+  assessmentNote?: string;
+  allowedMinutes?: number;
   excursionCode?: string;
   decisionBasis?: string;
   proposedBy?: string;

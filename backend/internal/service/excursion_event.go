@@ -25,13 +25,15 @@ type ExcursionEventService interface {
 
 type excursionEventService struct {
 	repository  repository.ExcursionEventRepository
+	containers  repository.TransportContainerRepository
+	windows     repository.TemperatureWindowRepository
 	disposition repository.DispositionDecisionRepository
 	evidence    repository.SensorEvidenceRepository
 	security    SecurityService
 }
 
-func NewExcursionEventService(repo repository.ExcursionEventRepository, disposition repository.DispositionDecisionRepository, evidence repository.SensorEvidenceRepository, security SecurityService) ExcursionEventService {
-	return &excursionEventService{repository: repo, disposition: disposition, evidence: evidence, security: security}
+func NewExcursionEventService(repo repository.ExcursionEventRepository, containers repository.TransportContainerRepository, windows repository.TemperatureWindowRepository, disposition repository.DispositionDecisionRepository, evidence repository.SensorEvidenceRepository, security SecurityService) ExcursionEventService {
+	return &excursionEventService{repository: repo, containers: containers, windows: windows, disposition: disposition, evidence: evidence, security: security}
 }
 
 func (s *excursionEventService) List(ctx context.Context, query dto.PageQuery) (repository.Page[model.ExcursionEvent], error) {
@@ -69,11 +71,75 @@ func (s *excursionEventService) Create(ctx context.Context, input dto.CreateExcu
 	if item.ContainerCode == "" || item.WindowCode == "" || item.SensorEvidence == "" || item.DurationMinutes < 1 {
 		return model.ExcursionEvent{}, fmt.Errorf("%w: container, temperature window, duration and sensor evidence are required", ErrInvalidInput)
 	}
+	// 读取对应温控规则并自动评估；规则缺失或过期时照常登记并提示人工判断。
+	var window *model.TemperatureWindow
+	if rule, err := s.windows.GetByCode(ctx, item.WindowCode); err == nil {
+		window = &rule
+	}
+	assessment := assessExcursion(window, &item)
+	resultNote := ""
+	switch assessment.outcome {
+	case AssessmentAutoQuarantine:
+		note, downgraded, err := s.quarantineContainer(ctx, &item, assessment, actor, requestID)
+		if err != nil {
+			return model.ExcursionEvent{}, err
+		}
+		resultNote = note
+		if downgraded {
+			assessment.outcome = AssessmentManualReview
+		}
+	case AssessmentReviewRequired:
+		resultNote = "结果：未超允许时长，容器状态不变，请复核"
+	case AssessmentWithinLimits:
+		resultNote = "结果：温度在允许范围内，容器继续运输"
+	default:
+		resultNote = "结果：已照常登记，请人工判断"
+	}
+	item.AssessmentOutcome = assessment.outcome
+	item.AllowedMinutes = assessment.allowedMinutes
+	item.AssessmentNote = assessment.basis + "；" + resultNote + "。"
 	if err := s.repository.Create(ctx, &item); err != nil {
 		return model.ExcursionEvent{}, fmt.Errorf("create 偏差事件: %w", err)
 	}
-	_ = s.security.Audit(ctx, actor, requestID, "create", "ExcursionEvent", item.ID, "", item.Status, "created 偏差事件")
+	detail, _ := json.Marshal(map[string]any{
+		"assessment": item.AssessmentOutcome, "observedTempC": item.ObservedTempC,
+		"durationMinutes": item.DurationMinutes, "allowedMinutes": item.AllowedMinutes,
+		"containerCode": item.ContainerCode, "windowCode": item.WindowCode,
+	})
+	_ = s.security.Audit(ctx, actor, requestID, "create", "ExcursionEvent", item.ID, "", item.Status, string(detail))
 	return item, nil
+}
+
+// quarantineContainer moves the container to quarantine before the excursion is
+// persisted, so a failed move never leaves a registered-but-still-shipping
+// container behind. A container already in quarantine is left untouched. The
+// returned flag reports whether the assessment must degrade to manual review.
+func (s *excursionEventService) quarantineContainer(ctx context.Context, item *model.ExcursionEvent, assessment excursionAssessment, actor, requestID string) (string, bool, error) {
+	container, err := s.containers.GetByCode(ctx, item.ContainerCode)
+	if err != nil {
+		return fmt.Sprintf("容器 %s 未登记，无法自动隔离，请人工处理", item.ContainerCode), true, nil
+	}
+	if container.Status == string(constants.ContainerStateQuarantine) {
+		return fmt.Sprintf("容器 %s 已处于隔离状态，本次不重复迁移", container.Code), false, nil
+	}
+	if !constants.CanTransition(constants.TransportContainerTransitions, container.Status, string(constants.ContainerStateQuarantine)) {
+		return fmt.Sprintf("容器 %s 当前状态 %s 不允许自动隔离，请人工处理", container.Code, container.Status), true, nil
+	}
+	before := container.Status
+	expectedVersion := container.Version
+	container.Status = string(constants.ContainerStateQuarantine)
+	container.Version = expectedVersion + 1
+	container.UpdatedAt = time.Now().UTC()
+	detail, _ := json.Marshal(map[string]any{
+		"reason": "excursion auto quarantine", "excursionCode": item.Code,
+		"observedTempC": item.ObservedTempC, "durationMinutes": item.DurationMinutes,
+		"allowedMinutes": assessment.allowedMinutes,
+	})
+	audit := auditLog(actor, requestID, "transition", "TransportContainer", container.ID, before, container.Status, string(detail))
+	if err := s.containers.Update(ctx, container.ID, expectedVersion, &container, audit); err != nil {
+		return "", false, fmt.Errorf("auto quarantine 运输容器: %w", err)
+	}
+	return fmt.Sprintf("容器 %s 已自动隔离（%s → quarantine）", container.Code, before), false, nil
 }
 
 func (s *excursionEventService) Update(ctx context.Context, id uint, input dto.UpdateExcursionEvent, actor, requestID string) (model.ExcursionEvent, error) {

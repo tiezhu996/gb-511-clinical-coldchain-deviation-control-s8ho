@@ -12,8 +12,9 @@ import (
 type TransportContainerRepository interface {
 	List(context.Context, dto.PageQuery) (Page[model.TransportContainer], error)
 	Get(context.Context, uint) (model.TransportContainer, error)
+	GetByCode(context.Context, string) (model.TransportContainer, error)
 	Create(context.Context, *model.TransportContainer) error
-	Update(context.Context, uint, uint, *model.TransportContainer) error
+	Update(context.Context, uint, uint, *model.TransportContainer, ...*model.AuditLog) error
 	Delete(context.Context, uint) error
 	CountByStatus(context.Context) (map[string]int64, error)
 }
@@ -32,11 +33,14 @@ func (r *transportContainerRepository) List(ctx context.Context, q dto.PageQuery
 func (r *transportContainerRepository) Get(ctx context.Context, id uint) (model.TransportContainer, error) {
 	return r.store.Get(ctx, id)
 }
+func (r *transportContainerRepository) GetByCode(ctx context.Context, code string) (model.TransportContainer, error) {
+	return r.store.GetByCode(ctx, code)
+}
 func (r *transportContainerRepository) Create(ctx context.Context, item *model.TransportContainer) error {
 	return r.store.Create(ctx, item)
 }
-func (r *transportContainerRepository) Update(ctx context.Context, id, version uint, item *model.TransportContainer) error {
-	return r.store.Update(ctx, id, version, item)
+func (r *transportContainerRepository) Update(ctx context.Context, id, version uint, item *model.TransportContainer, audits ...*model.AuditLog) error {
+	return r.store.Update(ctx, id, version, item, audits...)
 }
 func (r *transportContainerRepository) Delete(ctx context.Context, id uint) error {
 	return r.store.Delete(ctx, id)
